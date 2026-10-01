@@ -1,12 +1,13 @@
-//! Echo cancellation runs in real-time audio callbacks, where allocating
-//! memory can block. This test checks that steady-state processing with the
-//! echo canceller enabled does not allocate. It counts allocations of the
-//! current thread only, so tests running in parallel do not interfere.
+//! Echo cancellation and gain control run in real-time audio callbacks, where
+//! allocating memory can block. These tests check that steady-state
+//! processing with the echo canceller and with AGC2's adaptive digital gain
+//! does not allocate. They count allocations of the current thread only, so
+//! tests running in parallel do not interfere.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use sonora::config::EchoCanceller;
+use sonora::config::{AdaptiveDigital, EchoCanceller, GainController2};
 use sonora::{AudioProcessing, Config, StreamConfig};
 
 thread_local! {
@@ -60,20 +61,47 @@ impl Noise {
 
 #[test]
 fn echo_cancellation_does_not_allocate_in_steady_state() {
+    let config = Config {
+        echo_canceller: Some(EchoCanceller::default()),
+        ..Config::default()
+    };
+    assert_eq!(steady_state_allocations(config), 0);
+}
+
+#[test]
+fn gain_control_does_not_allocate_in_steady_state() {
+    let gain_controller2 = Some(GainController2 {
+        adaptive_digital: Some(AdaptiveDigital::default()),
+        ..GainController2::default()
+    });
+    let alone = Config {
+        gain_controller2: gain_controller2.clone(),
+        ..Config::default()
+    };
+    assert_eq!(steady_state_allocations(alone), 0);
+    let after_echo_cancellation = Config {
+        echo_canceller: Some(EchoCanceller::default()),
+        gain_controller2,
+        ..Config::default()
+    };
+    assert_eq!(steady_state_allocations(after_echo_cancellation), 0);
+}
+
+/// Processes 15 s of render and capture audio with `config` and returns the
+/// allocations after the first 5 s.
+fn steady_state_allocations(config: Config) -> usize {
     const RATE: u32 = 48_000;
     const FRAME: usize = 480;
     let stream = StreamConfig::new(RATE, 1);
     let mut apm = AudioProcessing::builder()
-        .config(Config {
-            echo_canceller: Some(EchoCanceller::default()),
-            ..Config::default()
-        })
+        .config(config)
         .capture_config(stream)
         .render_config(stream)
         .build();
 
     // Far end with pauses, an echo delayed by 60 ms and near-end talk every
-    // fourth second (double talk), so that all echo canceller paths run.
+    // fourth second (double talk), so that all echo canceller paths run, and
+    // the gain controller sees both quiet and loud frames.
     let frames = 1500;
     let mut noise = Noise(0x1234_5678_9abc_def1);
     let far: Vec<f32> = (0..frames * FRAME)
@@ -110,5 +138,5 @@ fn echo_cancellation_does_not_allocate_in_steady_state() {
     }
     COUNTING.with(|c| c.set(false));
 
-    assert_eq!(ALLOCATIONS.with(Cell::get), 0);
+    ALLOCATIONS.with(|a| a.replace(0))
 }
