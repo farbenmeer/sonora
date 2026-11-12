@@ -11,6 +11,7 @@ use crate::audio_buffer::AudioBuffer;
 use crate::audio_converter::AudioConverter;
 use crate::capture_levels_adjuster::CaptureLevelsAdjuster;
 use crate::config::{Config, DownmixMethod, NoiseSuppressionLevel, RuntimeSetting};
+use crate::denormal_disabler::DenormalDisabler;
 use crate::echo_canceller3::EchoCanceller3;
 use crate::gain_controller2::{
     Agc2AdaptiveDigitalConfig, Agc2Config, Agc2InputVolumeControllerConfig, FixedDigitalConfig,
@@ -197,18 +198,21 @@ impl AudioProcessingImpl {
             capture_rms_interval_counter: 0,
             echo_canceller3_config: None,
         };
+        if !DenormalDisabler::is_supported() {
+            tracing::info!("Denormal disabler unsupported");
+        }
         apm.initialize();
         apm
     }
 
-    /// Installs the residual echo detector (opt-in).
-    ///
-    /// Must be called before `initialize()`.
     /// Sets the AEC3 configuration used when the echo canceller is created.
     pub(crate) fn set_echo_canceller3_config(&mut self, config: EchoCanceller3Config) {
         self.echo_canceller3_config = Some(config);
     }
 
+    /// Installs the residual echo detector (opt-in).
+    ///
+    /// Must be called before `initialize()`.
     pub(crate) fn set_echo_detector(&mut self) {
         self.submodules.echo_detector = Some(ResidualEchoDetector::new());
     }
@@ -330,6 +334,7 @@ impl AudioProcessingImpl {
     /// Processes a capture audio frame.
     ///
     /// `src` and `dest` are deinterleaved float channel slices, one per channel.
+    #[inline(never)]
     pub(crate) fn process_stream(
         &mut self,
         src: &[&[f32]],
@@ -337,6 +342,12 @@ impl AudioProcessingImpl {
         output_config: &StreamConfig,
         dest: &mut [&mut [f32]],
     ) {
+        // SAFETY: the pipeline tolerates flushed subnormals; upstream runs it
+        // under the same guard (audio_processing_impl.cc, DenormalDisabler).
+        // Foreign code in the window (tracing subscribers, the allocator, the
+        // panic hook) is documented on `AudioProcessing`. `#[inline(never)]`
+        // keeps caller code from being inlined into the window.
+        let _denormal_disabler = unsafe { DenormalDisabler::new() };
         self.maybe_initialize_capture(input_config, output_config);
 
         let capture_audio = self.capture.capture_audio.as_mut().unwrap();
@@ -361,6 +372,7 @@ impl AudioProcessingImpl {
     /// Processes a reverse (render / far-end) audio frame.
     ///
     /// `src` and `dest` are deinterleaved float channel slices, one per channel.
+    #[inline(never)]
     pub(crate) fn process_reverse_stream(
         &mut self,
         src: &[&[f32]],
@@ -368,6 +380,12 @@ impl AudioProcessingImpl {
         output_config: &StreamConfig,
         dest: &mut [&mut [f32]],
     ) {
+        // SAFETY: the pipeline tolerates flushed subnormals; upstream runs it
+        // under the same guard (audio_processing_impl.cc, DenormalDisabler).
+        // Foreign code in the window (tracing subscribers, the allocator, the
+        // panic hook) is documented on `AudioProcessing`. `#[inline(never)]`
+        // keeps caller code from being inlined into the window.
+        let _denormal_disabler = unsafe { DenormalDisabler::new() };
         self.maybe_initialize_render(input_config, output_config);
         self.analyze_reverse_stream_locked(src, input_config);
 
@@ -395,6 +413,7 @@ impl AudioProcessingImpl {
     }
 
     /// Processes a capture audio frame (int16, interleaved).
+    #[inline(never)]
     pub(crate) fn process_stream_i16(
         &mut self,
         src: &[i16],
@@ -402,6 +421,12 @@ impl AudioProcessingImpl {
         output_config: &StreamConfig,
         dest: &mut [i16],
     ) {
+        // SAFETY: the pipeline tolerates flushed subnormals; upstream runs it
+        // under the same guard (audio_processing_impl.cc, DenormalDisabler).
+        // Foreign code in the window (tracing subscribers, the allocator, the
+        // panic hook) is documented on `AudioProcessing`. `#[inline(never)]`
+        // keeps caller code from being inlined into the window.
+        let _denormal_disabler = unsafe { DenormalDisabler::new() };
         self.maybe_initialize_capture(input_config, output_config);
 
         let capture_audio = self.capture.capture_audio.as_mut().unwrap();
@@ -437,6 +462,7 @@ impl AudioProcessingImpl {
     }
 
     /// Processes a reverse (render / far-end) audio frame (int16, interleaved).
+    #[inline(never)]
     pub(crate) fn process_reverse_stream_i16(
         &mut self,
         src: &[i16],
@@ -444,6 +470,12 @@ impl AudioProcessingImpl {
         output_config: &StreamConfig,
         dest: &mut [i16],
     ) {
+        // SAFETY: the pipeline tolerates flushed subnormals; upstream runs it
+        // under the same guard (audio_processing_impl.cc, DenormalDisabler).
+        // Foreign code in the window (tracing subscribers, the allocator, the
+        // panic hook) is documented on `AudioProcessing`. `#[inline(never)]`
+        // keeps caller code from being inlined into the window.
+        let _denormal_disabler = unsafe { DenormalDisabler::new() };
         self.maybe_initialize_render(input_config, output_config);
 
         let render_audio = self.render.render_audio.as_mut().unwrap();
@@ -691,10 +723,11 @@ impl AudioProcessingImpl {
                     .capture_multi_band_processing_active(ec_active)
                 {
                     // Copy the multi-band processed audio to the fullband buffer.
-                    // Temporarily take capture_audio to avoid double &mut borrow.
-                    let mut capture = self.capture.capture_audio.take().unwrap();
-                    capture.copy_to_buffer(fullband);
-                    self.capture.capture_audio = Some(capture);
+                    self.capture
+                        .capture_audio
+                        .as_mut()
+                        .unwrap()
+                        .copy_to_buffer(fullband);
                 }
             }
 
@@ -1290,13 +1323,21 @@ impl AudioProcessingImpl {
         let mut config = match &self.echo_canceller3_config {
             Some(custom) => {
                 let mut custom = custom.clone();
-                let _ = custom.validate();
+                if !custom.validate() {
+                    tracing::warn!("Invalid EchoCanceller3Config; clamped to valid ranges");
+                }
                 custom
             }
             None => EchoCanceller3Config::default(),
         };
         config.echo_removal_control.transparent_mode = ec.transparent_mode;
-        let multichannel_config = Some(EchoCanceller3Config::create_default_multichannel_config());
+        // Like C++ `AudioProcessingImpl::InitializeEchoController`: the default
+        // multichannel config is used only when the caller set no config. A
+        // caller's config applies to mono and multichannel render alike.
+        let multichannel_config = match self.echo_canceller3_config {
+            Some(_) => None,
+            None => Some(EchoCanceller3Config::create_default_multichannel_config()),
+        };
 
         self.submodules.echo_controller = Some(EchoCanceller3::new(
             config,
